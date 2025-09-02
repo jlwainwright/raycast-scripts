@@ -10,8 +10,13 @@
 # @raycast.icon 🛠️
 # @raycast.description Create comprehensive step-by-step implementation guide from YouTube videos
 # @raycast.argument1 { "type": "text", "placeholder": "YouTube URL" }
+# @raycast.argument2 { "type": "dropdown", "placeholder": "AI Provider", "data": [
+#   {"title": "Claude Code (Default)", "value": "claude"},
+#   {"title": "Gemini Pro 2.5", "value": "gemini"}
+# ], "optional": true }
 
 URL="$1"
+PROVIDER="${2:-claude}"  # Default to Claude if not specified
 TEMP_DIR="/tmp/yt-guide-$$"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 TRANSCRIPT_FILE="$HOME/Downloads/yt-transcript-$TIMESTAMP.txt"
@@ -37,28 +42,50 @@ if [ -z "$URL" ]; then
     exit 1
 fi
 
-# Set Claude Code OAuth token (fallback if not in environment)
-if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-    export CLAUDE_CODE_OAUTH_TOKEN="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"
-fi
-
-# Verify token is available
-if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-    echo -e "${RED}⌛ Error: CLAUDE_CODE_OAUTH_TOKEN environment variable is not set${NC}"
-    echo -e "${YELLOW}Add to ~/.zshrc or ~/.bash_profile:${NC}"
-    echo -e "export CLAUDE_CODE_OAUTH_TOKEN='your-oauth-token-here'"
+# Provider-specific API key checks
+if [ "$PROVIDER" = "claude" ]; then
+    # Set Claude Code OAuth token (fallback if not in environment)
+    if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        export CLAUDE_CODE_OAUTH_TOKEN="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"
+    fi
+    
+    # Verify token is available
+    if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        echo -e "${RED}⌛ Error: CLAUDE_CODE_OAUTH_TOKEN environment variable is not set${NC}"
+        echo -e "${YELLOW}Add to ~/.zshrc or ~/.bash_profile:${NC}"
+        echo -e "export CLAUDE_CODE_OAUTH_TOKEN='your-oauth-token-here'"
+        exit 1
+    fi
+elif [ "$PROVIDER" = "gemini" ]; then
+    # Check for Gemini API key
+    if [ -z "$GEMINI_API_KEY" ]; then
+        echo -e "${RED}⌛ Error: GEMINI_API_KEY environment variable is not set${NC}"
+        echo -e "${YELLOW}To get a key:${NC}"
+        echo -e "1. Go to https://aistudio.google.com/apikey"
+        echo -e "2. Create a new API key"
+        echo -e "3. Add to ~/.zshrc: export GEMINI_API_KEY='your-key-here'"
+        exit 1
+    fi
+else
+    echo -e "${RED}⌛ Error: Invalid provider '$PROVIDER'. Use 'claude' or 'gemini'${NC}"
     exit 1
 fi
 
-# Check dependencies
-for cmd in yt-dlp claude; do
+# Provider-specific dependency checks
+if [ "$PROVIDER" = "claude" ]; then
+    REQUIRED_CMDS="yt-dlp claude"
+else
+    REQUIRED_CMDS="yt-dlp curl jq"
+fi
+
+for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &> /dev/null; then
         echo -e "${RED}⌛ Error: $cmd is not installed${NC}"
-        if [ "$cmd" = "yt-dlp" ]; then
-            echo -e "${YELLOW}Install with: brew install yt-dlp${NC}"
-        elif [ "$cmd" = "claude" ]; then
-            echo -e "${YELLOW}Install with: curl -fsSL https://claude.ai/install.sh | sh${NC}"
-        fi
+        case "$cmd" in
+            "yt-dlp") echo -e "${YELLOW}Install with: brew install yt-dlp${NC}" ;;
+            "claude") echo -e "${YELLOW}Install with: curl -fsSL https://claude.ai/install.sh | sh${NC}" ;;
+            "curl"|"jq") echo -e "${YELLOW}Install with: brew install $cmd${NC}" ;;
+        esac
         exit 1
     fi
 done
@@ -68,6 +95,7 @@ cd "$TEMP_DIR"
 
 echo -e "${BLUE}🛠️ YouTube Implementation Guide Generator${NC}"
 echo -e "${YELLOW}URL: $URL${NC}"
+echo -e "${YELLOW}AI Provider: $([ "$PROVIDER" = "claude" ] && echo "Claude Code CLI" || echo "Google Gemini Pro 2.5")${NC}"
 echo
 
 # Get video info
@@ -262,39 +290,122 @@ Create numbered steps with:
 Transcript:
 $TRANSCRIPT_TEXT"
 
-echo -e "${PURPLE}🤖 Generating comprehensive implementation guide with Claude Code CLI...${NC}"
-
-# Call Claude Code CLI with retries
-MAX_RETRIES=3
-RETRY_COUNT=0
-SUCCESS=false
-
-while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
-    if [ $RETRY_COUNT -gt 0 ]; then
-        echo -e "${YELLOW}🔄 Retry attempt $RETRY_COUNT...${NC}"
-        sleep 3
-    fi
+# Provider-specific processing
+if [ "$PROVIDER" = "claude" ]; then
+    echo -e "${PURPLE}🤖 Generating comprehensive implementation guide with Claude Code CLI...${NC}"
     
-    # Call Claude Code CLI
-    if GUIDE_CONTENT=$(claude -p "$IMPLEMENTATION_PROMPT" 2>"$TEMP_DIR/claude_error.log"); then
-        if [ -n "$GUIDE_CONTENT" ]; then
-            SUCCESS=true
-            echo -e "${GREEN}✅ Implementation guide generated successfully${NC}"
-        else
-            echo -e "${YELLOW}⚠️ Empty response from Claude CLI${NC}"
+    # Call Claude Code CLI with retries
+    MAX_RETRIES=3
+    RETRY_COUNT=0
+    SUCCESS=false
+    
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
+        if [ $RETRY_COUNT -gt 0 ]; then
+            echo -e "${YELLOW}🔄 Retry attempt $RETRY_COUNT...${NC}"
+            sleep 3
         fi
-    else
-        ERROR_MSG=$(cat "$TEMP_DIR/claude_error.log" 2>/dev/null || echo "Unknown error")
-        echo -e "${YELLOW}⚠️ Claude CLI Error: $ERROR_MSG${NC}"
         
-        if [[ "$ERROR_MSG" == *"rate"* ]] || [[ "$ERROR_MSG" == *"limit"* ]]; then
-            echo -e "${YELLOW}⏳ Rate limited, waiting 10 seconds...${NC}"
-            sleep 10
+        # Call Claude Code CLI
+        if GUIDE_CONTENT=$(claude -p "$IMPLEMENTATION_PROMPT" 2>"$TEMP_DIR/claude_error.log"); then
+            if [ -n "$GUIDE_CONTENT" ]; then
+                SUCCESS=true
+                echo -e "${GREEN}✅ Implementation guide generated successfully${NC}"
+            else
+                echo -e "${YELLOW}⚠️ Empty response from Claude CLI${NC}"
+            fi
+        else
+            ERROR_MSG=$(cat "$TEMP_DIR/claude_error.log" 2>/dev/null || echo "Unknown error")
+            echo -e "${YELLOW}⚠️ Claude CLI Error: $ERROR_MSG${NC}"
+            
+            if [[ "$ERROR_MSG" == *"rate"* ]] || [[ "$ERROR_MSG" == *"limit"* ]]; then
+                echo -e "${YELLOW}⏳ Rate limited, waiting 10 seconds...${NC}"
+                sleep 10
+            fi
         fi
-    fi
+        
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+    done
+
+elif [ "$PROVIDER" = "gemini" ]; then
+    echo -e "${PURPLE}🤖 Generating comprehensive implementation guide with Gemini Pro 2.5...${NC}"
     
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-done
+    # Gemini API configuration
+    MODEL="gemini-2.0-flash-exp"  # Latest model for complex technical tasks
+    GEMINI_ENDPOINT="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent"
+    
+    # Prepare prompt for JSON (escape special characters)
+    ESCAPED_PROMPT=$(echo "$IMPLEMENTATION_PROMPT" | jq -Rs .)
+    
+    # Call Gemini API with retries
+    MAX_RETRIES=3
+    RETRY_COUNT=0
+    SUCCESS=false
+    
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
+        if [ $RETRY_COUNT -gt 0 ]; then
+            echo -e "${YELLOW}🔄 Retry attempt $RETRY_COUNT...${NC}"
+            sleep 3
+        fi
+        
+        # Create JSON payload
+        JSON_PAYLOAD=$(cat <<EOF
+{
+  "contents": [{
+    "parts": [{
+      "text": $ESCAPED_PROMPT
+    }]
+  }],
+  "generationConfig": {
+    "temperature": 0.3,
+    "maxOutputTokens": 8192,
+    "topP": 0.95,
+    "topK": 40
+  }
+}
+EOF
+)
+        
+        # Make API call
+        HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TEMP_RESPONSE" \
+            -H "Content-Type: application/json" \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -X POST \
+            -d "$JSON_PAYLOAD" \
+            "$GEMINI_ENDPOINT")
+        
+        if [ "$HTTP_CODE" = "200" ]; then
+            # Check for valid response
+            if [ -s "$TEMP_RESPONSE" ]; then
+                ERROR_MSG=$(jq -r '.error.message // empty' "$TEMP_RESPONSE" 2>/dev/null)
+                
+                if [ -z "$ERROR_MSG" ]; then
+                    GUIDE_CONTENT=$(jq -r '.candidates[0].content.parts[0].text // empty' "$TEMP_RESPONSE" 2>/dev/null)
+                    
+                    if [ -n "$GUIDE_CONTENT" ]; then
+                        SUCCESS=true
+                        echo -e "${GREEN}✅ Implementation guide generated successfully${NC}"
+                    else
+                        echo -e "${YELLOW}⚠️ Empty response from Gemini API${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}⚠️ API Error: $ERROR_MSG${NC}"
+                    if [[ "$ERROR_MSG" == *"quota"* ]] || [[ "$ERROR_MSG" == *"rate"* ]]; then
+                        echo -e "${YELLOW}⏳ Rate limited, waiting 10 seconds...${NC}"
+                        sleep 10
+                    fi
+                fi
+            fi
+        else
+            echo -e "${YELLOW}⚠️ HTTP Error: $HTTP_CODE${NC}"
+            if [ "$HTTP_CODE" = "429" ]; then
+                echo -e "${YELLOW}⏳ Rate limited, waiting 10 seconds...${NC}"
+                sleep 10
+            fi
+        fi
+        
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+    done
+fi
 
 if [ "$SUCCESS" = false ]; then
     echo -e "${RED}❌ Failed to generate implementation guide after $MAX_RETRIES attempts${NC}"
@@ -411,7 +522,7 @@ $TRANSCRIPT_TEXT
 
 ---
 
-*This implementation guide was generated using Claude Code CLI from the video's transcript.*
+*This implementation guide was generated using $([ "$PROVIDER" = "claude" ] && echo "Claude Code CLI" || echo "Google Gemini Pro 2.5") from the video's transcript.*
 EOF
 fi
 
