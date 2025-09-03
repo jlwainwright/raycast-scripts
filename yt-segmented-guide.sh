@@ -23,9 +23,15 @@
 URL="$1"
 PROVIDER="${2:-claude}"
 SEGMENT_MINUTES="${3:-3}"  # Default 3-minute segments
+
+# Validate segment minutes is a number
+if ! [[ "$SEGMENT_MINUTES" =~ ^[0-9]+$ ]] || [ "$SEGMENT_MINUTES" -eq 0 ]; then
+    echo -e "${YELLOW}⚠️ Invalid segment minutes '$SEGMENT_MINUTES', using default 3 minutes${NC}"
+    SEGMENT_MINUTES=3
+fi
 TEMP_DIR="/tmp/yt-segmented-$$"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-GUIDE_FILE="$HOME/Downloads/yt-segmented-guide-$TIMESTAMP.md"
+# GUIDE_FILE will be set after getting video info
 SEGMENTS_DIR="$TEMP_DIR/segments"
 FRAMES_DIR="$TEMP_DIR/frames"
 
@@ -37,6 +43,30 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Token and cost tracking
+TOTAL_INPUT_TOKENS=0
+TOTAL_OUTPUT_TOKENS=0
+TOTAL_ESTIMATED_COST=0
+START_TIME=$(date +%s)
+
+# Token estimation function (rough approximation: 1 token ≈ 4 characters)
+estimate_tokens() {
+    local text="$1"
+    local char_count=$(echo "$text" | wc -c | tr -d ' ')
+    echo $((char_count / 4))
+}
+
+# Cost estimation function (Claude Opus pricing: $15 input, $75 output per 1M tokens)
+estimate_cost() {
+    local input_tokens=$1
+    local output_tokens=$2
+    # Convert to dollars (input: $15/1M, output: $75/1M tokens)
+    local input_cost=$(echo "scale=6; $input_tokens * 15 / 1000000" | bc -l 2>/dev/null || echo "0")
+    local output_cost=$(echo "scale=6; $output_tokens * 75 / 1000000" | bc -l 2>/dev/null || echo "0")
+    local total_cost=$(echo "scale=6; $input_cost + $output_cost" | bc -l 2>/dev/null || echo "0")
+    echo "$total_cost"
+}
 
 cleanup() {
     rm -rf "$TEMP_DIR"
@@ -109,6 +139,13 @@ VIDEO_TITLE=$(echo "$VIDEO_INFO" | jq -r '.title // "Unknown Title"')
 VIDEO_ID=$(echo "$VIDEO_INFO" | jq -r '.id // "unknown"')
 VIDEO_CHANNEL=$(echo "$VIDEO_INFO" | jq -r '.uploader // "Unknown Channel"')
 VIDEO_DURATION=$(echo "$VIDEO_INFO" | jq -r '.duration // 0')
+VIDEO_UPLOAD_DATE=$(echo "$VIDEO_INFO" | jq -r '.upload_date // "unknown"')
+
+# Create filename with video title, upload date, and channel
+SAFE_TITLE=$(echo "$VIDEO_TITLE" | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/ /_/g' | cut -c1-50)
+SAFE_CHANNEL=$(echo "$VIDEO_CHANNEL" | sed 's/[^a-zA-Z0-9]//g' | cut -c1-20)
+FORMATTED_DATE=$(echo "$VIDEO_UPLOAD_DATE" | sed 's/\(.\{4\}\)\(.\{2\}\)\(.\{2\}\)/\1-\2-\3/' 2>/dev/null || echo "unknown")
+GUIDE_FILE="$HOME/Downloads/${SAFE_TITLE}_${FORMATTED_DATE}_${SAFE_CHANNEL}_segmented-guide.md"
 
 # Convert duration
 HOURS=$((VIDEO_DURATION / 3600))
@@ -287,7 +324,16 @@ Note: $FRAME_COUNT_SEG frames were extracted from this segment and saved for man
         if SEGMENT_ANALYSIS=$(claude -p "$ENHANCED_PROMPT" 2>"$TEMP_DIR/claude_error_$seg.log"); then
             if [ -n "$SEGMENT_ANALYSIS" ]; then
                 ANALYSIS_LENGTH=$(echo "$SEGMENT_ANALYSIS" | wc -c | tr -d ' ')
-                echo -e "${GREEN}      ✅ Segment $seg analyzed ($ANALYSIS_LENGTH chars)${NC}"
+                
+                # Track tokens and costs
+                SEGMENT_INPUT_TOKENS=$(estimate_tokens "$ENHANCED_PROMPT")
+                SEGMENT_OUTPUT_TOKENS=$(estimate_tokens "$SEGMENT_ANALYSIS")
+                TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + SEGMENT_INPUT_TOKENS))
+                TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + SEGMENT_OUTPUT_TOKENS))
+                SEGMENT_COST=$(estimate_cost $SEGMENT_INPUT_TOKENS $SEGMENT_OUTPUT_TOKENS)
+                TOTAL_ESTIMATED_COST=$(echo "scale=6; $TOTAL_ESTIMATED_COST + $SEGMENT_COST" | bc -l 2>/dev/null || echo "$TOTAL_ESTIMATED_COST")
+                
+                echo -e "${GREEN}      ✅ Segment $seg analyzed ($ANALYSIS_LENGTH chars, ~$SEGMENT_INPUT_TOKENS→$SEGMENT_OUTPUT_TOKENS tokens, \$$(echo "$SEGMENT_COST" | cut -c1-7))${NC}"
             else
                 echo -e "${YELLOW}      ⚠️ Segment $seg empty response${NC}"
                 SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
@@ -376,7 +422,17 @@ EOF
             
             SEGMENT_ANALYSIS=$(jq -r '.candidates[0].content.parts[0].text // empty' "$TEMP_DIR/segment_response.json" 2>/dev/null)
             if [ -n "$SEGMENT_ANALYSIS" ]; then
-                echo -e "${GREEN}      ✅ Segment $seg analyzed${NC}"
+                ANALYSIS_LENGTH=$(echo "$SEGMENT_ANALYSIS" | wc -c | tr -d ' ')
+                
+                # Track tokens and costs for Gemini (different pricing: $1.25 input, $5 output per 1M tokens)
+                SEGMENT_INPUT_TOKENS=$(estimate_tokens "$SEGMENT_PROMPT")
+                SEGMENT_OUTPUT_TOKENS=$(estimate_tokens "$SEGMENT_ANALYSIS")
+                TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + SEGMENT_INPUT_TOKENS))
+                TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + SEGMENT_OUTPUT_TOKENS))
+                SEGMENT_COST=$(echo "scale=6; ($SEGMENT_INPUT_TOKENS * 1.25 + $SEGMENT_OUTPUT_TOKENS * 5) / 1000000" | bc -l 2>/dev/null || echo "0")
+                TOTAL_ESTIMATED_COST=$(echo "scale=6; $TOTAL_ESTIMATED_COST + $SEGMENT_COST" | bc -l 2>/dev/null || echo "$TOTAL_ESTIMATED_COST")
+                
+                echo -e "${GREEN}      ✅ Segment $seg analyzed ($ANALYSIS_LENGTH chars, ~$SEGMENT_INPUT_TOKENS→$SEGMENT_OUTPUT_TOKENS tokens, \$$(echo "$SEGMENT_COST" | cut -c1-7))${NC}"
             else
                 echo -e "${YELLOW}      ⚠️ Segment $seg analysis failed${NC}"
                 SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation
@@ -522,6 +578,15 @@ $TRANSCRIPT_TEXT
 
 ---
 
+## 💰 Generation Metrics
+
+- **Total Tokens:** $(printf '%,d' $((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS))) ($(printf '%,d' $TOTAL_INPUT_TOKENS) input + $(printf '%,d' $TOTAL_OUTPUT_TOKENS) output)
+- **Estimated Cost:** \$$(echo "$TOTAL_ESTIMATED_COST" | cut -c1-7) ($([ "$PROVIDER" = "claude" ] && echo "Claude Opus" || echo "Gemini 2.0 Flash") pricing)
+- **Processing Time:** ${DURATION_MIN}m ${DURATION_SEC}s
+- **Efficiency:** \$$(echo "scale=4; $TOTAL_ESTIMATED_COST / ($DURATION / 60)" | bc -l 2>/dev/null || echo "0.0000")/min
+
+---
+
 *This segmented implementation guide was generated using $([ "$PROVIDER" = "claude" ] && echo "Claude Code CLI" || echo "Google Gemini Pro 2.5") with $TOTAL_SEGMENTS segments of $SEGMENT_MINUTES minutes each for detailed analysis.*
 EOF
 
@@ -543,6 +608,21 @@ if [ -f "$GUIDE_FILE" ]; then
     echo -e "${PURPLE}   • Total Sections: $SECTION_COUNT${NC}"
     echo -e "${PURPLE}   • Implementation Steps: $STEP_COUNT${NC}"
     echo -e "${PURPLE}   • Segments Analyzed: $TOTAL_SEGMENTS${NC}"
+    
+    # Calculate session duration and display cost metrics
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    DURATION_MIN=$((DURATION / 60))
+    DURATION_SEC=$((DURATION % 60))
+    
+    echo
+    echo -e "${CYAN}💰 Token & Cost Analysis:${NC}"
+    echo -e "${CYAN}   • Input Tokens: $(printf '%,d' $TOTAL_INPUT_TOKENS)${NC}"
+    echo -e "${CYAN}   • Output Tokens: $(printf '%,d' $TOTAL_OUTPUT_TOKENS)${NC}"
+    echo -e "${CYAN}   • Total Tokens: $(printf '%,d' $((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS)))${NC}"
+    echo -e "${CYAN}   • Estimated Cost: \$$(echo "$TOTAL_ESTIMATED_COST" | cut -c1-7) ($([ "$PROVIDER" = "claude" ] && echo "Claude Opus" || echo "Gemini 2.0 Flash") rates)${NC}"
+    echo -e "${CYAN}   • Processing Time: ${DURATION_MIN}m ${DURATION_SEC}s${NC}"
+    echo -e "${CYAN}   • Cost per Minute: \$$(echo "scale=4; $TOTAL_ESTIMATED_COST / ($DURATION / 60)" | bc -l 2>/dev/null || echo "0.0000")/min${NC}"
     echo
     
     # Open file
