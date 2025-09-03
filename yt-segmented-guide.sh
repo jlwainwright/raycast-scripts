@@ -229,83 +229,106 @@ for ((seg=1; seg<=TOTAL_SEGMENTS; seg++)); do
     mkdir -p "$SEGMENT_FRAMES_DIR"
     ffmpeg -i "$SEGMENT_FILE" -vf "fps=1/$((SEGMENT_SECONDS/3))" -q:v 2 "$SEGMENT_FRAMES_DIR/frame_%02d.jpg" -y >/dev/null 2>&1
     
-    # Get transcript segment (with overlap)
+    # Get transcript segment (fixed approach using word arrays)
+    WORDS_TOTAL=$(echo "$TRANSCRIPT_TEXT" | wc -w | tr -d ' ')
+    WORDS_PER_SEGMENT=$((WORDS_TOTAL / TOTAL_SEGMENTS))
+    OVERLAP_WORDS=$((WORDS_PER_SEGMENT / 10))  # 10% overlap
+    
     START_WORD=$(((seg - 1) * WORDS_PER_SEGMENT - OVERLAP_WORDS))
-    if [ $START_WORD -lt 0 ]; then START_WORD=0; fi
+    if [ $START_WORD -lt 1 ]; then START_WORD=1; fi  # sed uses 1-based indexing
     
     END_WORD=$((seg * WORDS_PER_SEGMENT + OVERLAP_WORDS))
+    if [ $END_WORD -gt $WORDS_TOTAL ]; then END_WORD=$WORDS_TOTAL; fi
     
-    SEGMENT_TRANSCRIPT=$(echo "$TRANSCRIPT_TEXT" | tr ' ' '\n' | sed -n "${START_WORD},${END_WORD}p" | tr '\n' ' ')
+    # Extract segment using word-based indexing (more reliable)
+    SEGMENT_TRANSCRIPT=$(echo "$TRANSCRIPT_TEXT" | tr ' ' '\n' | sed -n "${START_WORD},${END_WORD}p" | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
+    
     SEGMENT_WORD_COUNT=$(echo "$SEGMENT_TRANSCRIPT" | wc -w | tr -d ' ')
     
-    # Create segment-specific prompt
-    SEGMENT_PROMPT="You are analyzing segment $seg of $TOTAL_SEGMENTS from a technical YouTube video. Create a detailed implementation section for this specific part.
+    # Debug: Show segment info
+    echo -e "${CYAN}      📊 Segment words: $START_WORD-$END_WORD, Total: $SEGMENT_WORD_COUNT${NC}"
+    
+    # Create simplified segment prompt
+    SEGMENT_PROMPT="Analyze this video segment and create detailed implementation steps:
 
-Video: $VIDEO_TITLE ($VIDEO_CHANNEL)
+Video: $VIDEO_TITLE
 Segment: $seg/$TOTAL_SEGMENTS (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
-Transcript words: $SEGMENT_WORD_COUNT
 
-Focus on this segment and provide:
+Create implementation steps with:
+1. What's covered in this segment
+2. Specific implementation steps with code examples
+3. Configuration details
+4. Checklist of tasks
 
-## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
-
-### 📋 What's Covered in This Segment
-- Key concepts introduced
-- Technical components discussed
-- Visual elements shown
-
-### 🛠️ Implementation Steps for This Section
-1. **Step 1:** [Specific actionable instruction]
-   - Code example: \`\`\`language
-   [actual code from this segment]
-   \`\`\`
-   - Expected output: [what should happen]
-
-2. **Step 2:** [Next specific instruction]
-   - Configuration: [specific settings]
-   - Validation: [how to verify it works]
-
-(Continue with all steps for this segment...)
-
-### 💻 Code Examples from This Segment
-- Include ALL code shown or discussed in this timeframe
-- File structures created
-- Configuration changes
-- Commands executed
-
-### ✅ Segment Checklist
-- [ ] Task 1 from this segment
-- [ ] Task 2 from this segment
-- [ ] Validation steps
-
-### 🔍 Key Insights
-- Important points from this segment
-- Common pitfalls mentioned
-- Best practices discussed
-
-Segment Transcript:
+Transcript:
 $SEGMENT_TRANSCRIPT"
 
     # Analyze segment with chosen provider
     echo -e "${PURPLE}      🤖 Analyzing with $([ "$PROVIDER" = "claude" ] && echo "Claude" || echo "Gemini")...${NC}"
     
     if [ "$PROVIDER" = "claude" ]; then
-        # Claude analysis with frame attachments
-        CLAUDE_ARGS=()
-        for frame in $(find "$SEGMENT_FRAMES_DIR" -name "*.jpg" 2>/dev/null | head -3); do
-            CLAUDE_ARGS+=(--image "$frame")
-        done
-        
-        if SEGMENT_ANALYSIS=$(claude -p "$SEGMENT_PROMPT" "${CLAUDE_ARGS[@]}" 2>/dev/null); then
-            echo -e "${GREEN}      ✅ Segment $seg analyzed${NC}"
-        else
-            echo -e "${YELLOW}      ⚠️ Segment $seg analysis failed, using transcript only${NC}"
-            SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
+        # Claude analysis - text only for now (Claude CLI doesn't support image attachments easily)
+        # Add frame information to the prompt instead
+        FRAME_INFO=""
+        FRAME_LIST=$(find "$SEGMENT_FRAMES_DIR" -name "*.jpg" 2>/dev/null | head -3)
+        if [ -n "$FRAME_LIST" ]; then
+            FRAME_COUNT_SEG=$(echo "$FRAME_LIST" | wc -l | tr -d ' ')
+            FRAME_INFO="
 
-**Analysis failed - manual review needed**
+Note: $FRAME_COUNT_SEG frames were extracted from this segment and saved for manual review if needed."
+        fi
+        
+        ENHANCED_PROMPT="$SEGMENT_PROMPT$FRAME_INFO"
+        
+        # Debug: Show prompt length
+        PROMPT_LENGTH=$(echo "$ENHANCED_PROMPT" | wc -c | tr -d ' ')
+        echo -e "${CYAN}      📏 Prompt: $PROMPT_LENGTH chars, Transcript: $SEGMENT_WORD_COUNT words${NC}"
+        
+        if SEGMENT_ANALYSIS=$(claude -p "$ENHANCED_PROMPT" 2>"$TEMP_DIR/claude_error_$seg.log"); then
+            if [ -n "$SEGMENT_ANALYSIS" ]; then
+                ANALYSIS_LENGTH=$(echo "$SEGMENT_ANALYSIS" | wc -c | tr -d ' ')
+                echo -e "${GREEN}      ✅ Segment $seg analyzed ($ANALYSIS_LENGTH chars)${NC}"
+            else
+                echo -e "${YELLOW}      ⚠️ Segment $seg empty response${NC}"
+                SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
+
+**Empty response - trying shorter prompt**
 
 Transcript excerpt:
 $SEGMENT_TRANSCRIPT"
+            fi
+        else
+            ERROR_MSG=$(cat "$TEMP_DIR/claude_error_$seg.log" 2>/dev/null || echo "Unknown error")
+            echo -e "${YELLOW}      ⚠️ Segment $seg failed: $ERROR_MSG${NC}"
+            
+            # Try a much simpler prompt as fallback
+            SIMPLE_PROMPT="Create implementation steps for this video segment:
+
+$SEGMENT_TRANSCRIPT"
+            
+            echo -e "${CYAN}      🔄 Trying simplified prompt...${NC}"
+            if SEGMENT_ANALYSIS=$(claude -p "$SIMPLE_PROMPT" 2>/dev/null); then
+                if [ -n "$SEGMENT_ANALYSIS" ]; then
+                    echo -e "${GREEN}      ✅ Segment $seg analyzed with simple prompt${NC}"
+                    SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
+
+$SEGMENT_ANALYSIS"
+                else
+                    SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
+
+**Both detailed and simple prompts failed**
+
+Transcript excerpt:
+$SEGMENT_TRANSCRIPT"
+                fi
+            else
+                SEGMENT_ANALYSIS="## 🔧 Segment $seg Implementation (${START_MIN}:$(printf '%02d' $START_SEC) - ${END_MIN}:$(printf '%02d' $END_SEC))
+
+**Analysis failed: $ERROR_MSG**
+
+Transcript excerpt:
+$SEGMENT_TRANSCRIPT"
+            fi
         fi
         
     elif [ "$PROVIDER" = "gemini" ]; then
